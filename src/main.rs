@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, Level};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::{CorsLayer, Any}, trace::TraceLayer };
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -25,10 +25,16 @@ struct AppState {
 async fn upload_keypackage(
     State(state): State<AppState>,
     Json(payload): Json<UploadKeyPackagePayload>,
-) {
+)-> impl IntoResponse {
     println!("upload_keypackage: {:?}", payload);
     let mut db = state.key_packages.write().await;
     db.insert(payload.user_id, payload.key_package);
+    
+    Json({
+        serde_json::json!({
+            "status": "ok"
+        })
+    })
 }
 
 async fn get_keypackages(
@@ -53,7 +59,11 @@ async fn log_request(request: Request<Body>, next: axum::middleware::Next)  -> R
 }
 
 async fn preflight() -> impl IntoResponse {
-    ""
+    Json({
+        serde_json::json!({
+            "status": "ok"
+        })
+    })
 }
 
 #[tokio::main]
@@ -65,18 +75,18 @@ async fn main() {
     let state = AppState::default();
 
     let cors = CorsLayer::new()
-    .allow_origin("https://stream.bandia.vn".parse::<HeaderValue>().unwrap()) // Chỉ cho phép frontend của bạn
-    .allow_methods([Method::GET, Method::POST, Method::OPTIONS]) // Cho phép các method cần thiết
-    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    .allow_origin(Any) 
+    .allow_methods([Method::GET, Method::POST, Method::OPTIONS]) 
+    .allow_headers(Any);
     let app = Router::new()
-        .layer(axum::middleware::from_fn(log_request))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
         .route("/health", post(|| async { "OK" }))
         .route("/mls/upload_keypackage", post(upload_keypackage))
         .route("/mls/upload_keypackage", axum::routing::options(preflight))
         .route("/mls/get_keypackages", post(get_keypackages))
         .route("/mls/get_keypackages", axum::routing::options(preflight))
+        .layer(cors)
+        .layer(axum::middleware::from_fn(log_request))
+        .layer(TraceLayer::new_for_http())
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:5151")
         .await
