@@ -1,9 +1,9 @@
 use axum::{
     body::Body,
-    extract::State,
-    http::{ Method, Request, HeaderMap },
-    response::{ IntoResponse, Response, sse::Event, Sse },
-    routing::{ post, get },
+    extract::{ Path, Query, State },
+    http::{ HeaderMap, Method, Request, StatusCode },
+    response::{ sse::Event, IntoResponse, Response, Sse },
+    routing::{ get, post },
     Json,
     Router,
 };
@@ -12,7 +12,7 @@ use tracing::{ info, Level };
 use std::{ collections::{ HashMap, HashSet }, sync::Arc };
 use tower_http::{ cors::{ CorsLayer, Any }, trace::TraceLayer };
 use tracing_subscriber::FmtSubscriber;
-use tokio::sync::{ broadcast, mpsc, RwLock };
+use tokio::sync::{ mpsc, RwLock };
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UploadKeyPackagePayload {
@@ -27,6 +27,7 @@ pub struct FetchKeyPackagePayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ChatMessage {
+    room_id: Option<String>,
     from: String, // sender
     to: Vec<String>, //group id
     mess_type: String, // welcome, encrypt_message, ping
@@ -39,6 +40,20 @@ struct AppState {
     rooms: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ConnectSseQuery {
+    user_id: Option<String>,
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GetRoomMemberQuery {
+    room_id: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AddUserToRoom {
+    user_ids: Vec<String>,
+    room_id: String,
+}
+
 async fn upload_keypackage(
     State(state): State<AppState>,
     Json(payload): Json<UploadKeyPackagePayload>
@@ -46,7 +61,6 @@ async fn upload_keypackage(
     println!("upload_keypackage: {:?}", payload);
     let mut db = state.key_packages.write().await;
     db.insert(payload.user_id, payload.key_package);
-
     Json({ serde_json::json!({
             "status": "ok"
         }) })
@@ -82,13 +96,19 @@ async fn preflight() -> impl IntoResponse {
 
 async fn sse_handler(
     State(state): State<AppState>,
-    headers: HeaderMap
-) -> Sse<impl futures::Stream<Item = Result<Event, axum::Error>>> {
-    let user_id = headers
-        .get("user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    Query(query): Query<ConnectSseQuery>
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, axum::Error>>>,
+    (StatusCode, &'static str)
+> {
+    let user_id = match &query.user_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => {
+            return Err((StatusCode::BAD_REQUEST, "user_id is required"));
+        }
+    };
+
+    println!("User ID connected to SSE: {user_id}");
 
     let (tx, mut rx) = mpsc::channel(100);
 
@@ -98,10 +118,11 @@ async fn sse_handler(
     }
 
     let _ = tx.send(ChatMessage {
+        room_id: None,
         from: "server".to_string(),
         to: vec!["room_id".to_string()],
         mess_type: "ping".to_string(),
-        message: b"welcome to server".to_vec(),
+        message: b"Welcome to server".to_vec(),
     }).await;
 
     let stream = async_stream::stream! {
@@ -115,59 +136,62 @@ async fn sse_handler(
         }
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
 async fn send_message(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(payload): Json<ChatMessage>
-) -> Json<ChatMessage> {
-    let room_id = headers
-        .get("room-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+) -> impl IntoResponse {
+    let users = state.users.read().await;
 
-    if let Some(users_in_room) = state.rooms.read().await.get(&room_id) {
-        let users = state.users.read().await;
-
-        if payload.mess_type == "welcomeMessage" {
-            for user_id in payload.to.iter() {
-                if let Some(sender) = users.get(user_id) {
-                    let _ = sender.send(payload.clone()).await;
-                }
+    if payload.mess_type == "WelcomeMessage" {
+        for user_id in &payload.to {
+            if let Some(sender) = users.get(user_id) {
+                let _ = sender.send(payload.clone()).await;
             }
-        } else {
+        }
+    } else {
+        let room_id = match &payload.room_id {
+            Some(room_id) => room_id,
+            None => {
+                return Err((StatusCode::BAD_REQUEST, "room_id is required "));
+            }
+        };
+
+        let rooms = state.rooms.read().await;
+        println!("room in db:{:?}", rooms);
+        if let Some(users_in_room) = rooms.get(room_id) {
             for user_id in users_in_room {
-                if let Some(sender) = users.get(user_id) {
-                    let _ = sender.send(payload.clone()).await;
+                if payload.from.as_bytes() != user_id.as_bytes() {
+                    if let Some(sender) = users.get(user_id) {
+                        let _ = sender.send(payload.clone()).await;
+                    }
                 }
             }
         }
     }
-    Json(payload)
+
+    Ok(Json(payload))
 }
 
-async fn add_user_to_room(State(state): State<AppState>, headers: HeaderMap) -> Json<&'static str> {
-    let user_id = headers
-        .get("user-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+async fn add_user_to_room(
+    State(state): State<AppState>,
+    Json(payload): Json<AddUserToRoom>
+) -> Json<&'static str> {
+    let user_ids = payload.user_ids;
 
-    let room_id = headers
-        .get("room-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let room_id = payload.room_id;
 
     {
         let mut rooms = state.rooms.write().await;
-        rooms.entry(room_id.clone()).or_insert_with(HashSet::new).insert(user_id.clone());
+        let room_members = rooms.entry(room_id.clone()).or_insert_with(HashSet::new);
+        for user_id in user_ids {
+            println!("Users: {user_id} was added to room: {room_id}");
+            room_members.insert(user_id.clone());
+        }
     }
-
-    Json("User added to room")
+    Json("Users was added to room:")
 }
 
 async fn list_rooms(State(state): State<AppState>) -> Json<Vec<String>> {
@@ -175,12 +199,11 @@ async fn list_rooms(State(state): State<AppState>) -> Json<Vec<String>> {
     Json(rooms.keys().cloned().collect())
 }
 
-async fn list_room_members(State(state): State<AppState>, headers: HeaderMap) -> Json<Vec<String>> {
-    let room_id = headers
-        .get("room-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+async fn list_room_members(
+    State(state): State<AppState>,
+    Query(query): Query<GetRoomMemberQuery>
+) -> Json<Vec<String>> {
+    let room_id = query.room_id;
     println!("{room_id}");
     let rooms = state.rooms.read().await;
     if let Some(room) = rooms.get(&room_id) {
@@ -211,9 +234,10 @@ async fn main() {
             post(|| async { "OK" })
         )
         .route("/mls/upload_keypackage", post(upload_keypackage))
-        .route("/mls/upload_keypackage", axum::routing::options(preflight))
+        // .route("/mls/upload_keypackage", axum::routing::options(preflight))
         .route("/mls/get_keypackages", post(get_keypackages))
-        .route("/mls/get_keypackages", axum::routing::options(preflight))
+        // .route("/mls/get_keypackages", axum::routing::options(preflight))
+        // .route("/subscribe/{user_id}", get(sse_handler))
         .route("/subscribe", get(sse_handler))
         .route("/send", post(send_message))
         .route("/rooms", get(list_rooms))
