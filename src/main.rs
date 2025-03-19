@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
-    extract::{ Path, Query, State },
-    http::{ HeaderMap, Method, Request, StatusCode },
+    extract::{ Query, State },
+    http::{ Method, Request, StatusCode },
     response::{ sse::Event, IntoResponse, Response, Sse },
     routing::{ get, post },
     Json,
@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{ Deserialize, Serialize };
 use tracing::{ info, Level };
-use std::{ collections::{ HashMap, HashSet }, sync::Arc };
+use std::{ collections::{ HashMap, HashSet }, sync::Arc, time::{ SystemTime, UNIX_EPOCH } };
 use tower_http::{ cors::{ CorsLayer, Any }, trace::TraceLayer };
 use tracing_subscriber::FmtSubscriber;
 use tokio::sync::{ mpsc, RwLock };
@@ -27,11 +27,14 @@ pub struct FetchKeyPackagePayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ChatMessage {
+    message_id: String,
     room_id: Option<String>,
     from: String, // sender
     to: Vec<String>, //group id
     mess_type: String, // welcome, encrypt_message, ping
     message: Vec<u8>, // mls encrypt message or string bytes
+    // created_at: u64,
+    created_at: String,
 }
 #[derive(Clone, Default)]
 struct AppState {
@@ -88,12 +91,6 @@ async fn log_request(request: Request<Body>, next: axum::middleware::Next) -> Re
     response
 }
 
-async fn preflight() -> impl IntoResponse {
-    Json({ serde_json::json!({
-            "status": "ok"
-        }) })
-}
-
 async fn sse_handler(
     State(state): State<AppState>,
     Query(query): Query<ConnectSseQuery>
@@ -118,11 +115,17 @@ async fn sse_handler(
     }
 
     let _ = tx.send(ChatMessage {
+        message_id: uuid::Uuid::new_v4().to_string(),
         room_id: None,
         from: "server".to_string(),
         to: vec!["room_id".to_string()],
         mess_type: "ping".to_string(),
         message: b"Welcome to server".to_vec(),
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis()
+            .to_string(),
     }).await;
 
     let stream = async_stream::stream! {
@@ -152,6 +155,7 @@ async fn send_message(
             }
         }
     } else {
+        println!("payload: {:#?}", payload);
         let room_id = match &payload.room_id {
             Some(room_id) => room_id,
             None => {
