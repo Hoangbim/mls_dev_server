@@ -27,14 +27,11 @@ pub struct FetchKeyPackagePayload {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ChatMessage {
-    message_id: String,
     room_id: Option<String>,
     from: String, // sender
     to: Vec<String>, //group id
     mess_type: String, // welcome, encrypt_message, ping
     message: Vec<u8>, // mls encrypt message or string bytes
-    // created_at: u64,
-    created_at: String,
 }
 #[derive(Clone, Default)]
 struct AppState {
@@ -115,17 +112,11 @@ async fn sse_handler(
     }
 
     let _ = tx.send(ChatMessage {
-        message_id: uuid::Uuid::new_v4().to_string(),
         room_id: None,
         from: "server".to_string(),
         to: vec!["room_id".to_string()],
         mess_type: "ping".to_string(),
         message: b"Welcome to server".to_vec(),
-        created_at: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis()
-            .to_string(),
     }).await;
 
     let stream = async_stream::stream! {
